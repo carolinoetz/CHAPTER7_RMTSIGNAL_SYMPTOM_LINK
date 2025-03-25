@@ -58,44 +58,7 @@ fill <- function(x) {
 ```
 
 ```{r}
-df1 <- read_csv(here("radar_ids_features_hr_activity_steps.csv"))
-df2 <- read_csv(here("radar_ids_features_sd.csv"))
-
-# Define replacements
-replacements <- c("12_month_assessmen_arm_1" = 12,
-                  "15_month_assessmen_arm_1" = 15,
-                  "18_month_assessmen_arm_1" = 18,
-                  "21_month_assessmen_arm_1" = 21,
-                  "24_month_assessmen_arm_1" = 24,
-                  "27_month_assessmen_arm_1" = 27,
-                  "30_month_assessmen_arm_1" = 30,
-                  "33_month_assessmen_arm_1" = 33,
-                  "36_month_assessmen_arm_1" = 36,
-                  "39_month_assessmen_arm_1" = 39,
-                  "3_month_assessment_arm_1" = 3,
-                  "6_month_assessment_arm_1" = 6,
-                  "9_month_assessment_arm_1" = 9,
-                  "enrolment_arm_1" = 0)
-
-# Use mutate with replace function
-df1 <- df1 %>%
-  mutate(record_name = ifelse(record_name %in% names(replacements), replacements[record_name], record_name))
-
-colnames(df1)
-
-# Use mutate with replace function
-df2 <- df2 %>%
-  mutate(record_name = ifelse(record_name %in% names(replacements), replacements[record_name], record_name))
-
-colnames(df2)
-
-leepcols <- c("p_id", "record_name", "sleep_day","total_sleep_time_mean", "total_sleep_time_sd", "light_pct_mean", "deep_pct_mean", "REM_pct_mean", "awake_pct_mean", "sleep_onset_mean", "sleep_onset_sd", "sleep_offset_mean", "sleep_offset_sd", "sleep_efficiency_mean", "sleep_efficiency_sd",
-"awakenings_mean", "hypersomnia")
-
-df2 <- df2[sleepcols]
-
-df <- merge(df1, df2, by = c("p_id", "record_name"))
-```
+df <- read_csv(here("data.csv"))
 
 ```{r}
 # Create Sleep only DF
