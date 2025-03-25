@@ -1,0 +1,1311 @@
+---
+title: "RMTvsIDS_GITHUB"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+# **Digital Data Correlates of Depression**
+
+```{r}
+#| label: load-packages
+library(tidyverse)
+library(marginaleffects)
+library(readxl)
+library(table1)
+library(lme4)
+library(glmmTMB)
+library(arm)
+library(DHARMa)
+library(here)
+library(broom.mixed)
+library(glue)
+library(rempsyc)
+library(writexl)
+library(forestplot)
+library(patchwork)
+library(cowplot)
+library(ggplot2)
+
+
+library(conflicted)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+```
+
+# Data Preparation
+
+#### Functions for data prep
+
+```{r}
+# Define a function to fill missing ages
+fill <- function(x) {
+  if(all(is.na(x))) {
+    return(x)
+  }
+  else {
+    non_na_values <- na.omit(x)
+    if(length(non_na_values) > 0) {
+      fill_value <- non_na_values[1]
+      return(ifelse(is.na(x), fill_value, x))
+    }
+    else {
+      return(x)
+    }
+  }
+}
+```
+
+```{r}
+df1 <- read_csv(here("radar_ids_features_hr_activity_steps.csv"))
+df2 <- read_csv(here("radar_ids_features_sd.csv"))
+
+# Define replacements
+replacements <- c("12_month_assessmen_arm_1" = 12,
+                  "15_month_assessmen_arm_1" = 15,
+                  "18_month_assessmen_arm_1" = 18,
+                  "21_month_assessmen_arm_1" = 21,
+                  "24_month_assessmen_arm_1" = 24,
+                  "27_month_assessmen_arm_1" = 27,
+                  "30_month_assessmen_arm_1" = 30,
+                  "33_month_assessmen_arm_1" = 33,
+                  "36_month_assessmen_arm_1" = 36,
+                  "39_month_assessmen_arm_1" = 39,
+                  "3_month_assessment_arm_1" = 3,
+                  "6_month_assessment_arm_1" = 6,
+                  "9_month_assessment_arm_1" = 9,
+                  "enrolment_arm_1" = 0)
+
+# Use mutate with replace function
+df1 <- df1 %>%
+  mutate(record_name = ifelse(record_name %in% names(replacements), replacements[record_name], record_name))
+
+colnames(df1)
+
+# Use mutate with replace function
+df2 <- df2 %>%
+  mutate(record_name = ifelse(record_name %in% names(replacements), replacements[record_name], record_name))
+
+colnames(df2)
+
+leepcols <- c("p_id", "record_name", "sleep_day","total_sleep_time_mean", "total_sleep_time_sd", "light_pct_mean", "deep_pct_mean", "REM_pct_mean", "awake_pct_mean", "sleep_onset_mean", "sleep_onset_sd", "sleep_offset_mean", "sleep_offset_sd", "sleep_efficiency_mean", "sleep_efficiency_sd",
+"awakenings_mean", "hypersomnia")
+
+df2 <- df2[sleepcols]
+
+df <- merge(df1, df2, by = c("p_id", "record_name"))
+```
+
+```{r}
+# Create Sleep only DF
+selected_cols <- c("p_id", "record_name", "age", "gender", "IDS_TOTAL",
+                   
+                    "sleep_day","total_sleep_time_mean", "total_sleep_time_sd",
+                   "sleep_offset_mean", "sleep_offset_sd", 
+                   "sleep_efficiency_mean","sleep_efficiency_sd",
+                   
+                   "act_day","Sedentary_time_mean","Sedentary_time_sd",
+                    "Vigorous_activity_mean","Vigorous_activity_sd",
+                   
+                   "ids_1", "ids_2", "ids_3", 
+                   "ids_4", "ids_5", "ids_6", "ids_7", "ids_8", "ids_9",
+                   "ids_10", "ids_11", "ids_12", "ids_13", "ids_14", 
+                   "ids_15", "ids_16", "ids_17", "ids_18", "ids_19", 
+                   "ids_20", "ids_21", "ids_22", "ids_23", "ids_24",
+                   "ids_25", "ids_26", "ids_27", "ids_28", "ids_29",
+                   "ids_30")
+
+
+fitbit_data <- df[selected_cols]
+
+fitbit_data$age <- as.numeric(fitbit_data$age)
+fitbit_data$gender <- as.factor(fitbit_data$gender)
+
+# Apply the function to the age column grouped by participant
+fitbit_data <- fitbit_data %>%
+  group_by(p_id) %>%
+  mutate(age_all = fill(age))
+
+# Apply the function to the age column grouped by participant
+fitbit_data <- fitbit_data %>%
+  group_by(p_id) %>%
+  mutate(gender_all = fill(gender))
+
+# Have Age go up in units of 10 years 
+fitbit_data <- fitbit_data |> 
+mutate(age_all = age_all / 10)
+
+total_unique_p_ids <- length(unique(df$p_id))
+print(total_unique_p_ids)
+
+# Filter out >= 24 months data
+fitbit_data <- fitbit_data %>%
+  filter(record_name <= 24) 
+```
+
+# Setting up and transforming the data
+
+1.  Binary outcome measures; 2. Creating person centered mean values; 2. Standardizing the predictor variables (not re-centering the values)
+
+xmeans a mini function where X is the current column, so this creates a new column for each person's values within that column\`
+
+```{r}
+fitbit1 <- fitbit_data 
+threshold <- 2
+
+fitbit1 <- fitbit1 |>
+  mutate(across(starts_with("ids_"),
+                \(item) { as.numeric(item >= threshold) },
+                .names = "{.col}_B"))
+```
+
+```{r}
+# Creating Person Centered Mean Values
+predictors <- c("total_sleep_time_mean", "total_sleep_time_sd", "sleep_efficiency_mean",
+                   "sleep_efficiency_sd","Sedentary_time_mean","Vigorous_activity_mean",
+                "Sedentary_time_sd","Vigorous_activity_sd")
+
+fitbit1 <- fitbit1 %>%
+  group_by(p_id) %>%
+  mutate(across(all_of(predictors),
+                 \(x) mean(x, na.rm = TRUE),
+                 .names = "{.col}_m")) %>%
+  mutate(across(all_of(predictors), 
+                \(x) (x - (mean(x, na.rm = TRUE))),
+                .names = "{.col}_pm")) %>%
+  ungroup()
+
+fitbit1 <- fitbit1 %>%
+  mutate(across(ends_with("_pm"), 
+                 \(x) as.numeric(scale(x, center= FALSE)))) 
+
+fitbit1 <- fitbit1 %>%
+  mutate(across(all_of(predictors), 
+                 \(x) as.numeric(scale(x)))) 
+
+fitbit1 <- fitbit1 %>%
+  mutate(across(ends_with("_m"), 
+               \(x) as.numeric(scale(x)))) 
+```
+
+# Data SETUP
+
+```{r}
+sleep_data <- fitbit1 |>
+  filter(sleep_day >= 3)
+
+# Filter participants with act_day >= 3
+act_data <- fitbit1 %>%
+  filter(act_day >= 3)
+
+ssp_data <- read_csv("fv_merged_scripted_ids_14022025.csv")
+
+#dropping the age and gender cols associated with IDS data which is incomplete (as for some par there wasn't a baseline speech assessment)
+ssp_data <- ssp_data %>%
+  select(-c( "age", "gender")) 
+
+# Have Age go up in units of 10 years 
+ssp_data <- ssp_data |> 
+mutate(Age = Age / 10)
+
+# Rename Age and Gender Cols to match rest of code
+ssp_data <- ssp_data %>%
+  rename(gender_all = Gender, age_all = Age)
+
+# Check length & unique IDS
+ssp_total_unique_p_ids <- length(unique(ssp_data$p_id))
+print(ssp_total_unique_p_ids)
+
+# IDS - Binary 
+threshold <- 2
+ssp_data <- ssp_data |>
+  mutate(across(starts_with("ids_"),
+                \(item) { as.numeric(item >= threshold) },
+                .names = "{.col}_B"))
+
+############## Scripted ################
+
+# Creating Person Centered Mean Values
+predictors_s <- c("Speaking_Rate_Scripted","Intensity_Mean_Scripted")
+
+ssp_data <- ssp_data %>%
+  group_by(p_id) %>%
+  mutate(across(all_of(predictors_s),
+                 \(x) mean(x, na.rm = TRUE),
+                 .names = "{.col}_m")) %>%
+  mutate(across(all_of(predictors_s), 
+                \(x) (x - (mean(x, na.rm = TRUE))),
+                .names = "{.col}_pm")) %>%
+  ungroup()
+
+ssp_data <- ssp_data %>%
+  mutate(across(ends_with("_pm"), 
+                 \(x) as.numeric(scale(x, center=FALSE)))) 
+
+ssp_data <- ssp_data %>%
+  mutate(across(all_of(predictors_s), 
+                 \(x) as.numeric(scale(x)))) 
+
+ssp_data <- ssp_data %>%
+  mutate(across(ends_with("_m"), 
+               \(x) as.numeric(scale(x)))) 
+
+colnames(ssp_data)
+```
+
+# ------------------
+
+# Aim 1: Predicting of Total IDS-Score from RMT measures
+
+## Hypothesis Test Sleep
+
+```{r}
+conflicted::conflicts_prefer(lmerTest::lmer)
+library(lmerTest)
+#library(lme4)
+
+total_opt <- data.frame(
+  b= c("IDS_TOTAL"),
+  
+  x= c("total_sleep_time_mean_m", "total_sleep_time_sd_m", "sleep_efficiency_mean_m", "sleep_efficiency_sd_m", "Sedentary_time_mean_m", "Sedentary_time_sd_m","Vigorous_activity_mean_m", "Vigorous_activity_sd_m" , "Speaking_Rate_Scripted_m", "Intensity_Mean_Scripted_m"
+       ),
+  
+  y= c("total_sleep_time_mean_pm", "total_sleep_time_sd_pm", "sleep_efficiency_mean_pm","sleep_efficiency_sd_pm", "Sedentary_time_mean_pm", "Sedentary_time_sd_pm","Vigorous_activity_mean_pm", "Vigorous_activity_sd_pm" ,"Speaking_Rate_Scripted_pm", "Intensity_Mean_Scripted_pm"
+       ), 
+  
+  z= c("total_sleep_time_mean", "total_sleep_time_sd", "sleep_efficiency_mean", "sleep_efficiency_sd","Sedentary_time_mean", "Sedentary_time_sd","Vigorous_activity_mean" ,"Vigorous_activity_sd", "Speaking_Rate_Scripted", "Intensity_Mean_Scripted"
+       ) 
+  )
+
+total_opt
+```
+
+### PM & M - Linear vs Quad
+
+```{r}
+# Subset the first 3 rows of total_opt - for the sake of the different dataframes
+subset_sleep_total_opt <- total_opt[1:4, ]
+subset_act_total_opt <- total_opt[5:8, ]
+subset_ssp_total_opt <- total_opt[9:10, ]
+
+rownames(subset_sleep_total_opt) <- NULL
+rownames(subset_act_total_opt) <- NULL
+rownames(subset_ssp_total_opt) <- NULL
+
+```
+
+```{r}
+# NOT SCALED
+fit_model <- function(b, x, y, data) {
+  formula_string <- str_glue("{b} ~ {y} + {x} + gender_all + age_all + (1 | p_id)")
+  lmer(as.formula(formula_string), data = data)
+}
+
+#Sleep
+subset_sleep_total_opt$fit_linear <- pmap(subset_sleep_total_opt, 
+                     \(b, x, y, ...) {
+                       fit_model(b, x, y, 
+                            data = sleep_data)
+                       })
+
+# Activity 
+subset_act_total_opt$fit_linear <- pmap(subset_act_total_opt, 
+                     \(b, x, y, ...) {
+                       fit_model(b, x, y, 
+                                 data = act_data)
+                       })
+
+# Scripted Speech 
+subset_ssp_total_opt$fit_linear <- pmap(subset_ssp_total_opt, 
+                     \(b, x, y, ...) {
+                       fit_model(b, x, y, 
+                                 data = ssp_data)
+                       })
+```
+
+### Total - Linear vs Quad
+
+```{r}
+# NOT SCALED
+fit_model_T <- function(b, z, data) {
+    formula_string <- str_glue("{b} ~ {z} + gender_all + age_all + (1 | p_id)")
+    lmer(as.formula(formula_string), data = data)
+}
+
+#Sleep 
+subset_sleep_total_opt$fit_linear_total <- pmap(subset_sleep_total_opt, 
+                     \(b, z, ...) {
+                       fit_model_T(b, z, 
+                                 data = sleep_data)
+                       })
+
+#Activity 
+subset_act_total_opt$fit_linear_total <- pmap(subset_act_total_opt, 
+                     \(b, z, ...) { 
+                       fit_model_T(b, z,
+                                 data = act_data)
+                       })
+
+
+#SSP 
+subset_ssp_total_opt$fit_linear_total <- pmap(subset_ssp_total_opt, 
+                     \(b, z, ...) { 
+                       fit_model_T(b, z,
+                                 data = ssp_data)
+                       })
+```
+
+### Extracting Estimates
+
+```{r}
+total_opt <- rbind(subset_sleep_total_opt,subset_act_total_opt, subset_ssp_total_opt)
+```
+
+```{r}
+# Code to print results for all the lines in opt. 
+total_opt$slopes_l <- map(total_opt$fit_linear, 
+                        \(fit) tidy(fit, conf.int = TRUE))
+total_opt$slopes_l_total <- map(total_opt$fit_linear_total, 
+                        \(fit) tidy(fit, conf.int = TRUE))
+
+total_opt$slopes_l
+total_opt$slopes_l_total
+
+total_opt |>
+  select(b, x, y) 
+
+make_cell_T <- function(results, x) {
+  results %>%
+    filter(term == x) %>%
+    select(term, estimate, df, p.value, conf.low, conf.high)
+}
+
+est_IDS_total <- 
+  bind_cols(map2_dfr(total_opt$slopes_l_total, total_opt$z, make_cell_T),
+            map2_dfr(total_opt$slopes_l, total_opt$x, make_cell_T), 
+            map2_dfr(total_opt$slopes_l, total_opt$y, make_cell_T)) 
+
+names(est_IDS_total) <- c("Total Effect", "Est_T", "df_T", "P_T","LO_T","HI_T",
+                      "Person Mean (BW effect)", "Est_pm", "df_pm","P_pm", "LO_pm", "HI_pm",
+                      "Person Centered Mean (Within effect)", "Est_cm", "df_cm","P_cm"
+                      ,"LO_cm"
+                      , "HI_cm"
+                      )
+
+est_IDS_total <- bind_cols(select(total_opt, b), est_IDS_total)
+est_IDS_total
+```
+
+## Results Table
+
+```{r}
+#Recordering the output
+est_IDS_total <- est_IDS_total[, c( "Total Effect","Est_T","df_T", "P_T", "LO_T","HI_T", "Person Mean (BW effect)","Est_pm","df_pm","P_pm","LO_pm" ,"HI_pm","Person Centered Mean (Within effect)","Est_cm", "df_cm","P_cm","LO_cm", "HI_cm")]
+
+ids_total_models <- nice_table(
+     est_IDS_total,
+     title = c("Table 1: Hypothesis Tests: Estimates of the association between total IDS-SR and digital features. Mixed-linear models with participant-specific random intercepts are presented, adjusting for age and gender"),
+     note = c(
+         " CI are not adjusted for multiple hypothesis testing "
+     ))
+ids_total_models
+```
+
+## Forest Plot
+
+### Clean data for forest plot
+
+```{r}
+TotalResults_T <- est_IDS_total %>%
+  select("Total Effect","Est_T", "df_T","LO_T","HI_T", "P_T" ) %>%
+  mutate(Model_type = "Total_Effect") %>%
+  rename(Feature = "Total Effect", 
+         Est = "Est_T",
+         df = "df_T",
+         LO = "LO_T", 
+         HI = "HI_T", 
+         pvalue = "P_T")
+
+BW_Results_T <- est_IDS_total %>%
+  select("Person Mean (BW effect)", "df_pm","Est_pm", "LO_pm","HI_pm", "P_pm" )%>%
+  mutate(Model_type = "PM_Effect") %>%
+  rename(Feature = "Person Mean (BW effect)",
+         Est = "Est_pm",
+         df = "df_pm",
+         LO = "LO_pm", 
+         HI = "HI_pm",
+         pvalue = "P_pm") 
+
+CM_Results_T <- est_IDS_total %>%
+  select("Person Centered Mean (Within effect)", "df_cm","Est_cm", "LO_cm","HI_cm", "P_cm")%>%
+  mutate(Model_type = "PCM_Effect") %>%
+  rename(Feature = "Person Centered Mean (Within effect)",
+         Est = "Est_cm",
+         df = "df_cm",
+         LO = "LO_cm", 
+         HI = "HI_cm", 
+         pvalue = "P_cm")
+
+combined_T <- bind_rows(TotalResults_T, BW_Results_T, CM_Results_T)
+combined_T <- combined_T %>%
+  mutate(
+    Feature = case_when(
+Feature == "total_sleep_time_mean" ~ "Total Sleep Time (M)",
+Feature == "total_sleep_time_sd" ~ "Total Sleep Time (SD)",
+Feature == "sleep_efficiency_mean" ~ "Sleep Efficiency (M)",
+Feature == "sleep_efficiency_sd" ~ "Sleep Efficiency (SD)",
+Feature == "Sedentary_time_mean" ~ "Sedentary Time (M)", 
+Feature == "Sedentary_time_sd" ~ "Sedentary Time (SD)", 
+Feature == "Vigorous_activity_mean" ~ "Vigorous Activity (M)", 
+Feature == "Vigorous_activity_sd" ~ "Vigorous Activity (SD)", 
+Feature == "Speaking_Rate_Scripted" ~ "(S) Speaking rate (M)", 
+Feature == "Intensity_Mean_Scripted" ~ "(S) Intensity (M)", 
+
+Feature == "total_sleep_time_mean_m" ~ "Total Sleep Time (M)",
+Feature == "total_sleep_time_sd_m" ~ "Total Sleep Time (SD)",
+Feature == "sleep_efficiency_mean_m" ~ "Sleep Efficiency (M)",
+Feature == "sleep_efficiency_sd_m" ~ "Sleep Efficiency (SD)",
+Feature == "Vigorous_activity_mean_m" ~ "Vigorous Activity (M)", 
+Feature == "Vigorous_activity_sd_m" ~ "Vigorous Activity (SD)", 
+Feature == "Sedentary_time_mean_m" ~ "Sedentary Time (M)", 
+Feature == "Sedentary_time_sd_m" ~ "Sedentary Time (SD)", 
+Feature == "Speaking_Rate_Scripted_m" ~ "(S) Speaking rate (M)", 
+Feature == "Intensity_Mean_Scripted_m" ~ "(S) Intensity (M)",  
+
+Feature == "total_sleep_time_mean_pm" ~ "Total Sleep Time (M)",
+Feature == "total_sleep_time_sd_pm" ~ "Total Sleep Time (SD)",
+Feature == "sleep_efficiency_mean_pm" ~ "Sleep Efficiency (M)",
+Feature == "sleep_efficiency_sd_pm" ~ "Sleep Efficiency (SD)",
+Feature == "Vigorous_activity_mean_pm" ~ "Vigorous Activity (M)", 
+Feature == "Vigorous_activity_sd_pm" ~ "Vigorous Activity (SD)", 
+Feature == "Sedentary_time_mean_pm" ~ "Sedentary Time (M)", 
+Feature == "Sedentary_time_sd_pm" ~ "Sedentary Time (SD)", 
+Feature == "Speaking_Rate_Scripted_pm" ~ "(S) Speaking rate (M)", 
+Feature == "Intensity_Mean_Scripted_pm" ~ "(S) Intensity (M)", 
+     TRUE ~ Feature  # Keep other values unchanged
+    )
+  ) 
+
+```
+
+### Making plot
+
+```{r}
+# Define the function
+add_nudge <- function(data) {
+  data <- data |>
+    mutate(nudge = case_when(
+      Model_type == "Total_Effect" ~ 0,
+      Model_type == "PM_Effect" ~ 0.3,
+      Model_type == "PCM_Effect" ~ -0.3
+    ))
+  return(data)
+}
+
+# Calling the function 
+combined_T <- add_nudge(combined_T)
+
+# Picking Colours 
+#7F9C22
+#848481
+#006D8C
+#FF8939
+#0098C3
+#C8DDA5
+#AABD5A
+#00708C
+#6FC3DC
+
+#define colours for dots and bars
+dotCols = c("#6FC3DC","#C8DDA5", "#FFB084")
+barCols = c("#00708C","#7F9C22", "#FF8939")
+
+# To change order of the presented variables in the forest plot 
+combined_T$Feature <- factor(combined_T$Feature, 
+                         levels = c("Total Sleep Time (M)", 
+                                    "Total Sleep Time (SD)", 
+                                    "Sleep Efficiency (M)", 
+                                    "Sleep Efficiency (SD)",
+                                    "Sedentary Time (M)", 
+                                    "Sedentary Time (SD)",
+                                    "Vigorous Activity (M)",
+                                    "Vigorous Activity (SD)",
+                                    "(S) Speaking rate (M)", 
+                                    "(S) Intensity (M)"))
+
+font = "Times"
+
+# Create Forest Plot 
+create_forest_plot <- function(data, title_suffix, caption) {
+  ggplot(data) +
+  aes(x = Est, 
+      y = Feature, 
+      xmin = LO, 
+      xmax = HI, 
+      color = Model_type, 
+      fill = Model_type) +
+  geom_errorbarh(height = 0,
+                 size = 3,
+                 position = position_nudge(y = data$nudge)) +
+  
+  geom_point(size = 3, shape =21, colour="white", stroke = 0.5, position =
+               position_nudge(y = data$nudge)) +
+  scale_color_manual(values = dotCols, 
+                     labels = c("PCM_Effect" = "Within-Person Effect", 
+                                "PM_Effect" = "Between-Person Effect" 
+                                ,"Total_Effect" = "Total Effect"
+                                )) +
+    
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", size = 0.5) +  
+  labs(x = "Slope\n(Negative = Lower IDS-SR score, Positive = Higher)", 
+       y = NULL, 
+       title = paste(title_suffix, ""), 
+       color = "Model Type") +
+    
+  theme(
+    strip.text.y.left = element_text(face = "bold", family = font,
+                              size = 12,
+                              hjust = 0.5,
+                              margin = margin(t = 1, r = 0.1, b = 1, l = 0.1, 
+                                              unit = "cm"),
+                              angle = 0, vjust = 0.5, 
+                    color= "black"),
+    plot.title = element_text(hjust=0.5),
+    plot.caption.position = "plot",
+    plot.caption = element_text(hjust = 0, size = 11, face = "italic", family = font), 
+    axis.ticks.y=element_blank(),
+    axis.text.y = element_blank(), 
+    axis.text.x = element_text(family = font, size = 10),  
+    axis.title=element_text(size=12,face
+                            ="bold", family = font), 
+    plot.margin = margin(t = 0.3, r = 0.2, b = 0, l = 0.2, unit = "cm"), 
+    panel.grid.minor = element_blank(),  
+  legend.text	= element_text(size = 11, family = font),
+   legend.title	= element_blank(),
+   legend.position = "bottom", 
+   legend.margin = margin(t = 0, r = 0.7, b = 0.2, l = 0.4, unit = "cm"),
+
+    ) +
+  guides(fill = FALSE) +
+  scale_x_continuous(breaks = seq(floor(min(data$LO)), ceiling(max(data$HI)), by = 1))+
+
+  scale_fill_manual(values = barCols)+
+  facet_grid(rows = vars(Feature),
+             scales = "free",
+             switch = "y"  )
+
+  }
+
+create_forest_plot(combined_T, "IDS-Total Score and Digital Features", "")
+```
+
+# -----------------------------
+
+# Aim 2 - Individual Symptom Items
+
+### Functions relevant to Aim 2
+
+```{r}
+# TOTAL MODEL 
+fit_model_T <- function(b, z, data) {
+    formula_string <- str_glue("{b} ~ {z} + gender_all + age_all + (1 | p_id)")
+    glmmTMB(as.formula(formula_string), family = binomial, data = data)
+}
+
+# BETWEEN & WITHIN MODEL 
+pm_fit_model <- function(b, x, y, data) {
+    formula_string <- str_glue("{b} ~ {y} + {x} + gender_all + age_all + (1 | p_id)")
+    glmmTMB(as.formula(formula_string), family = binomial, data = data)
+}
+
+# MAKE_CELL FUNCTION TO PULL out the coeffient for _pm and the CI
+make_cell <- function(results, x) {
+  results %>%
+    filter(term == x) %>%
+    select(term, estimate, p.value, conf.low, conf.high
+    )}
+
+# Define a function to generate plots for a given model
+PM_M_assumption_plots <- function(data, indices) {
+    for (model_index in indices) {
+      #DHARMA
+      DHARMA_plot <- plot(simulateResiduals(data$fit_linear[[model_index]], re.form = NULL))
+      title(paste(data$b[[model_index]], "&", data$z[[model_index]], "(P/PM)"), cex.main = 0.9, line = 0.6)
+
+      }}
+
+TE_assumption_plots <- function(data, indices) {
+  for (model_index in indices) {
+    # DHARMa assessment for residuals
+    DHARMA_plot <- plot(simulateResiduals(data$fit_linear_total[[model_index]], re.form = NULL))
+    title(paste(data$b[[model_index]], "&", data$z[[model_index]], "(T)"), cex.main = 0.9, line = 0.6)
+  }
+}
+```
+
+## Aim 2 - Sleep
+
+```{r}
+sleep_data <- fitbit1 |>
+  filter(sleep_day >= 3)
+
+selected_cols <- c("p_id","ids_1_B", "ids_2_B","ids_3_B", "ids_4_B", 
+                   "ids_15_B", "ids_16_B", "ids_5_B", "ids_18_B","ids_19_B",
+                   "ids_20_B", 
+              
+                   "total_sleep_time_mean_m", 
+                   "total_sleep_time_sd_m", 
+                    "sleep_efficiency_mean_m",
+                   "sleep_efficiency_sd_m",
+ 
+                   "total_sleep_time_mean_pm", 
+                   "total_sleep_time_sd_pm", 
+                   "sleep_efficiency_mean_pm",
+                   "sleep_efficiency_sd_pm",
+                   
+                   "total_sleep_time_mean", 
+                   "total_sleep_time_sd", 
+                    "sleep_efficiency_mean", 
+                   "sleep_efficiency_sd",
+                   
+                   "gender_all","age_all")
+
+sleep2 <- sleep_data[selected_cols]
+```
+
+```{r}
+opt_sleep <- data.frame(
+  b= c("ids_1_B","ids_1_B","ids_1_B", "ids_1_B", 
+       "ids_2_B","ids_2_B","ids_2_B","ids_2_B",
+       "ids_3_B", "ids_3_B", "ids_3_B", "ids_3_B", 
+       "ids_4_B",  "ids_4_B",  "ids_4_B", "ids_4_B", 
+       "ids_15_B", "ids_15_B","ids_15_B","ids_15_B",
+       "ids_16_B", "ids_16_B","ids_16_B","ids_16_B",
+       "ids_5_B", "ids_5_B","ids_5_B","ids_5_B",
+       "ids_18_B","ids_18_B","ids_18_B","ids_18_B",
+       "ids_19_B", "ids_19_B","ids_19_B","ids_19_B",
+       "ids_20_B", "ids_20_B" , "ids_20_B","ids_20_B"), 
+  
+  x= c("total_sleep_time_mean_m", "total_sleep_time_sd_m", "sleep_efficiency_mean_m", "sleep_efficiency_sd_m"),
+   
+  y= c("total_sleep_time_mean_pm", "total_sleep_time_sd_pm", "sleep_efficiency_mean_pm","sleep_efficiency_sd_pm"), 
+
+  z= c("total_sleep_time_mean", "total_sleep_time_sd", "sleep_efficiency_mean", "sleep_efficiency_sd")
+
+)
+
+```
+
+```{r}
+opt_sleep$fit_linear_total <- pmap(opt_sleep, 
+                     \(b, z, ...) {
+                       fit_model_T(b, z, 
+                                 data = sleep2)
+                       })
+```
+
+```{r}
+opt_sleep$fit_linear <- pmap(opt_sleep, 
+                     \(b, x, y, ...) {
+                       pm_fit_model(b, x, y, 
+                                 data = sleep2)
+                       })
+```
+
+```{r}
+# Code to print results for all the lines in opt. 
+opt_sleep$slopes_l <- map(opt_sleep$fit_linear, 
+                    \(fit) tidy(fit, conf.int = TRUE))
+opt_sleep$slopes_l_total <- map(opt_sleep$fit_linear_total, 
+                    \(fit) tidy(fit, conf.int = TRUE))
+
+opt_sleep |>
+  select(b, x, y) 
+
+est_sleep <- 
+  bind_cols(map2_dfr(opt_sleep$slopes_l_total, opt_sleep$z, make_cell),
+            map2_dfr(opt_sleep$slopes_l, opt_sleep$x, make_cell), 
+            map2_dfr(opt_sleep$slopes_l, opt_sleep$y, make_cell)) 
+
+  
+names(est_sleep) <- c("X_T", "Est_T", "P_T", "LO_T", "HI_T", 
+                      "X_m", "Est_m","P_m", "LO_m", "HI_m",
+                      "X_pm", "Est_pm", "P_pm","LO_pm", "HI_pm"
+                      )
+
+est_sleep <- bind_cols(select(opt_sleep, b), est_sleep)
+est_sleep
+```
+
+#### Testing Assumptions 
+
+```{r}
+#PM_M_assumption_plots(opt_sleep, c(1:40))
+#TE_assumption_plots(opt_sleep, c(1:40))
+```
+
+## Aim 2 - Activity 
+
+```{r}
+# Filter participants with act_day >= 3
+act_data <- fitbit1 %>%
+  filter(act_day >= 3)
+
+selected_cols <- c("p_id", "record_name",
+                   "ids_15_B", "ids_16_B", "ids_5_B","ids_18_B","ids_19_B","ids_20_B"
+                   ,"ids_23_B","ids_24_B",
+                   
+                   "Sedentary_time_mean","Sedentary_time_mean_m","Sedentary_time_mean_pm",
+                   "Sedentary_time_sd", "Sedentary_time_sd_m","Sedentary_time_sd_pm",
+                   "Vigorous_activity_mean", "Vigorous_activity_mean_m", "Vigorous_activity_mean_pm", 
+                   "Vigorous_activity_sd" , "Vigorous_activity_sd_m" , "Vigorous_activity_sd_pm", 
+                   
+                    "gender_all","age_all")
+
+act2 <- act_data[selected_cols]
+
+total_unique_p_ids_act <- length(unique(act2$p_id))
+# Print the total number of unique p_ids
+print(total_unique_p_ids_act)
+```
+
+```{r}
+opt_act <- data.frame(
+  b= c("ids_15_B","ids_15_B","ids_15_B","ids_15_B",
+       "ids_16_B", "ids_16_B", "ids_16_B", "ids_16_B", 
+       "ids_5_B","ids_5_B","ids_5_B","ids_5_B",
+       "ids_18_B", "ids_18_B","ids_18_B","ids_18_B",
+       "ids_19_B","ids_19_B","ids_19_B","ids_19_B",
+       "ids_20_B","ids_20_B","ids_20_B","ids_20_B",
+       "ids_23_B", "ids_23_B","ids_23_B","ids_23_B",
+       "ids_24_B","ids_24_B","ids_24_B", "ids_24_B"),
+  
+  x= c("Sedentary_time_mean_m", "Sedentary_time_sd_m",  "Vigorous_activity_mean_m",  "Vigorous_activity_sd_m"),
+  
+  y= c("Sedentary_time_mean_pm", "Sedentary_time_sd_pm",  "Vigorous_activity_mean_pm",  "Vigorous_activity_sd_pm"), 
+  
+  z= c("Sedentary_time_mean", "Sedentary_time_sd",  "Vigorous_activity_mean",  "Vigorous_activity_sd"))
+
+opt_act
+```
+
+Total Linear
+
+```{r}
+opt_act$fit_linear_total <- pmap(opt_act, 
+                     \(b, z, ...) {
+                       fit_model_T(b, z, 
+                                 data = act2)
+                       })
+
+```
+
+PM/M Linear
+
+```{r}
+opt_act$fit_linear <- pmap(opt_act, 
+                     \(b, x, y, ...) {
+                       pm_fit_model(b, x, y, 
+                                 data = act2)
+                       })
+```
+
+```{r}
+# Code to print results for all the lines in opt. 
+opt_act$slopes_l <- map(opt_act$fit_linear, 
+                    \(fit) tidy(fit, conf.int = TRUE))
+opt_act$slopes_l_total <- map(opt_act$fit_linear_total, 
+                    \(fit) tidy(fit, conf.int = TRUE))
+
+
+opt_act |>
+  select(b, x, y) 
+
+est_act <- 
+  bind_cols(map2_dfr(opt_act$slopes_l_total, opt_act$z, make_cell),
+            map2_dfr(opt_act$slopes_l, opt_act$x, make_cell), 
+            map2_dfr(opt_act$slopes_l, opt_act$y, make_cell)) 
+
+  
+names(est_act) <- c("X_T", "Est_T", "P_T", "LO_T", "HI_T", 
+                      "X_m", "Est_m","P_m", "LO_m", "HI_m",
+                      "X_pm", "Est_pm", "P_pm","LO_pm", "HI_pm"
+                      )
+
+est_act <- bind_cols(select(opt_act, b), est_act)
+est_act
+```
+
+#### Testing Assumptions 
+
+```{r}
+#PM_M_assumption_plots(opt_act, c(1:32))
+#TE_assumption_plots(opt_act, c(1:32))
+```
+
+# Speech Data
+
+note: window variable we used for the Fitbit data isn't relevant here as people should have only 1 speech recording measure associated with an IDS assessment. If they have multiple speech measures associated with a single IDS assessment we randomly selected one to keep as per step 4 above.
+
+## Setting up and transforming the data
+
+1.  Binary outcome measures; 2. Creating person centered mean values; 2. Standardizing the predictor variables (not re-centering the values)
+
+## Scripted Speech Analysis
+
+```{r}
+selected_cols <- c("p_id","gender_all", "age_all", 
+                   "ids_23_B", "ids_24_B"
+                   
+                   ,"Speaking_Rate_Scripted" 
+                  ,"Intensity_Mean_Scripted"           
+                  
+                  ,"Speaking_Rate_Scripted_m" 
+                  ,"Intensity_Mean_Scripted_m"           
+
+                  ,"Speaking_Rate_Scripted_pm"
+                  ,"Intensity_Mean_Scripted_pm")
+
+ssp2 <- ssp_data[selected_cols]
+```
+
+```{r}
+opt_ssp <- data.frame(
+  b= c("ids_23_B","ids_23_B",
+       "ids_24_B", "ids_24_B"),
+  
+  x= c("Speaking_Rate_Scripted_m", "Intensity_Mean_Scripted_m"),
+  
+  y= c("Speaking_Rate_Scripted_pm", "Intensity_Mean_Scripted_pm"), 
+ 
+  z= c("Speaking_Rate_Scripted", "Intensity_Mean_Scripted"))
+
+opt_ssp
+```
+
+```{r}
+opt_ssp$fit_linear_total <- pmap(opt_ssp, 
+                     \(b, z, ...) {
+                       fit_model_T(b, z, 
+                                 data = ssp2)
+                       })
+```
+
+```{r}
+opt_ssp$fit_linear <- pmap(opt_ssp, 
+                     \(b, x, y, ...) {
+                       pm_fit_model(b, x, y, 
+                                 data = ssp2)
+                       })
+```
+
+```{r}
+# Code to print results for all the lines in opt. 
+opt_ssp$slopes_l <- map(opt_ssp$fit_linear, 
+                        \(fit) tidy(fit, conf.int = TRUE))
+opt_ssp$slopes_l_total <- map(opt_ssp$fit_linear_total, 
+                        \(fit) tidy(fit, conf.int = TRUE))
+
+opt_ssp$slopes_l
+opt_ssp$slopes_l_total
+
+opt_ssp |>
+  select(b, x, y) 
+
+est_ssp <- 
+  bind_cols(map2_dfr(opt_ssp$slopes_l_total, opt_ssp$z, make_cell),
+            map2_dfr(opt_ssp$slopes_l, opt_ssp$x, make_cell), 
+            map2_dfr(opt_ssp$slopes_l, opt_ssp$y, make_cell)) 
+
+names(est_ssp) <- c("X_T", "Est_T", "P_T", "LO_T", "HI_T", 
+                      "X_m", "Est_m","P_m", "LO_m", "HI_m",
+                      "X_pm", "Est_pm", "P_pm","LO_pm", "HI_pm" 
+                      )
+
+est_ssp <- bind_cols(select(opt_ssp, b), est_ssp)
+est_ssp
+```
+
+#### Testing Assumptions
+
+```{r}
+#PM_M_assumption_plots(opt_ssp, c(1:4))
+#TE_assumption_plots(opt_ssp, c(1:4))
+```
+
+# Aim 2 - Table & Plots
+
+The fixed effect coefficients are not on the probability scale but on the log-odds, or *logit*, scale.
+
+<https://library.virginia.edu/data/articles/getting-started-with-binomial-generalized-linear-mixed-models>
+
+```{r}
+# Using colnames() function
+colnames(est_sleep) <- c("b","Total Effect (raw - scaled)", "Est_T", "P_T", "LO_T", "HI_T", "Person Mean (BW effect)", "Est_pm", "P_pm", "LO_pm", "HI_pm","Person Centered Mean (Within effect)", "Est_cm", "P_cm", "LO_cm", "HI_cm")
+colnames(est_act) <- c("b","Total Effect (raw - scaled)", "Est_T", "P_T", "LO_T", "HI_T", "Person Mean (BW effect)", "Est_pm", "P_pm", "LO_pm", "HI_pm","Person Centered Mean (Within effect)", "Est_cm", "P_cm", "LO_cm", "HI_cm")
+colnames(est_ssp) <- c("b","Total Effect (raw - scaled)", "Est_T", "P_T", "LO_T", "HI_T", "Person Mean (BW effect)", "Est_pm", "P_pm", "LO_pm", "HI_pm","Person Centered Mean (Within effect)", "Est_cm", "P_cm", "LO_cm", "HI_cm")
+
+combined_results <- rbind(est_sleep, est_act, est_ssp) 
+
+#Recordering the output
+combined_results <- combined_results[, c("b","Total Effect (raw - scaled)","Est_T", "P_T", "LO_T","HI_T", "Person Mean (BW effect)","Est_pm","P_pm","LO_pm" ,"HI_pm", "Person Centered Mean (Within effect)","Est_cm","P_cm","LO_cm", "HI_cm")]
+
+combined_results_outputs <- nice_table(
+     combined_results, col.format.p = c(4, 9, 14),
+     title = c("Table X:Genearlized Linear Models - Log-Odd Estimates and CIs for Total Effect Models, Between Participant Effects and Within-Participant Effects"),
+     note = c(
+         "Two seperate models were run, one for the total effect the other for the within and between participant variables. "
+     ))
+combined_results_outputs
+
+```
+
+#### Odds Ratio Forest Plots
+
+```{r}
+# Convert log odds to odds ratios
+columns_to_transform <- c("Est_T", "LO_T", "HI_T", "Est_pm", "LO_pm", "HI_pm", "Est_cm", "LO_cm", "HI_cm")
+
+combined_results_odds <- combined_results %>%
+  mutate(across(all_of(columns_to_transform),
+                 \(x) exp(x),
+                 .names = "OR_{.col}"))
+
+############
+TotalResults <- combined_results_odds %>%
+  select("b", "Total Effect (raw - scaled)", "OR_Est_T", "OR_LO_T","OR_HI_T") %>%
+  mutate(Model_type = "Total_Effect") %>%
+  rename(Feature = "Total Effect (raw - scaled)", 
+         OR_Est = "OR_Est_T",
+         OR_LO = "OR_LO_T", 
+         OR_HI = "OR_HI_T")
+
+BW_Results <- combined_results_odds %>%
+  select("b", "Person Mean (BW effect)", "OR_Est_pm", "OR_LO_pm","OR_HI_pm" )%>%
+  mutate(Model_type = "PM_Effect")%>%
+  rename(Feature = "Person Mean (BW effect)",
+         OR_Est = "OR_Est_pm",
+         OR_LO = "OR_LO_pm", 
+         OR_HI = "OR_HI_pm") 
+
+CM_Results <- combined_results_odds %>%
+  select("b", "Person Centered Mean (Within effect)", "OR_Est_cm", "OR_LO_cm","OR_HI_cm")%>%
+  mutate(Model_type = "PCM_Effect") %>%
+  rename(Feature = "Person Centered Mean (Within effect)",
+          OR_Est = "OR_Est_cm",
+         OR_LO = "OR_LO_cm", 
+         OR_HI = "OR_HI_cm")
+
+combined_ORs <- bind_rows(TotalResults, BW_Results, CM_Results)
+
+combined_ORs <- combined_ORs %>%
+  mutate(
+    Feature = case_when(
+Feature == "total_sleep_time_mean" ~ "Total Sleep Time (M)",
+Feature == "total_sleep_time_sd" ~ "Total Sleep Time (SD)",
+Feature == "sleep_efficiency_mean" ~ "Sleep Efficiency (M)",
+Feature == "sleep_efficiency_sd" ~ "Sleep Efficiency (SD)",
+Feature == "Sedentary_time_mean" ~ "Sedentary Time (M)", 
+Feature == "Sedentary_time_sd" ~ "Sedentary Time (SD)", 
+Feature == "Vigorous_activity_mean" ~ "Vigorous Activity (M)", 
+Feature == "Vigorous_activity_sd" ~ "Vigorous Activity (SD)", 
+Feature == "Speaking_Rate_Scripted" ~ "(S) Speaking rate (M)", 
+Feature == "Shimmer_scripted" ~ "Shimmer (M)", 
+
+Feature == "total_sleep_time_mean_m" ~ "Total Sleep Time (M)",
+Feature == "total_sleep_time_sd_m" ~ "Total Sleep Time (SD)",
+Feature == "sleep_efficiency_mean_m" ~ "Sleep Efficiency (M)",
+Feature == "sleep_efficiency_sd_m" ~ "Sleep Efficiency (SD)",
+Feature == "Vigorous_activity_mean_m" ~ "Vigorous Activity (M)", 
+Feature == "Vigorous_activity_sd_m" ~ "Vigorous Activity (SD)", 
+Feature == "Sedentary_time_mean_m" ~ "Sedentary Time (M)", 
+Feature == "Sedentary_time_sd_m" ~ "Sedentary Time (SD)", 
+Feature == "Speaking_Rate_Scripted_m" ~ "(S) Speaking rate (M)", 
+Feature == "Intensity_Mean_Scripted_m" ~ "(S) Intensity (M)",  
+
+Feature == "total_sleep_time_mean_pm" ~ "Total Sleep Time (M)",
+Feature == "total_sleep_time_sd_pm" ~ "Total Sleep Time (SD)",
+Feature == "sleep_efficiency_mean_pm" ~ "Sleep Efficiency (M)",
+Feature == "sleep_efficiency_sd_pm" ~ "Sleep Efficiency (SD)",
+Feature == "Vigorous_activity_mean_pm" ~ "Vigorous Activity (M)", 
+Feature == "Vigorous_activity_sd_pm" ~ "Vigorous Activity (SD)", 
+Feature == "Sedentary_time_mean_pm" ~ "Sedentary Time (M)", 
+Feature == "Sedentary_time_sd_pm" ~ "Sedentary Time (SD)", 
+Feature == "Speaking_Rate_Scripted_pm" ~ "(S) Speaking rate (M)", 
+Feature == "Intensity_Mean_Scripted_pm" ~ "(S) Intensity (M)", 
+     TRUE ~ Feature  # Keep other values unchanged
+    )
+  ) 
+
+ids_1_DF <- combined_ORs[combined_ORs$b == "ids_1_B", ]
+ids_2_DF <- combined_ORs[combined_ORs$b == "ids_2_B", ]
+ids_3_DF <- combined_ORs[combined_ORs$b == "ids_3_B", ]
+ids_4_DF <- combined_ORs[combined_ORs$b == "ids_4_B", ]
+ids_5_DF <- combined_ORs[combined_ORs$b == "ids_5_B", ]
+ids_15_DF <- combined_ORs[combined_ORs$b == "ids_15_B", ]
+ids_16_DF <- combined_ORs[combined_ORs$b == "ids_16_B", ]
+ids_18_DF <- combined_ORs[combined_ORs$b == "ids_18_B", ]
+ids_19_DF <- combined_ORs[combined_ORs$b == "ids_19_B", ]
+ids_20_DF <- combined_ORs[combined_ORs$b == "ids_20_B", ]
+ids_23_DF <- combined_ORs[combined_ORs$b == "ids_23_B", ]
+ids_24_DF <- combined_ORs[combined_ORs$b == "ids_24_B", ]
+
+```
+
+# Forest Plots
+
+<https://datascienceplus.com/lattice-like-forest-plot-using-ggplot2-in-r/>
+
+```{r}
+# To change order of the presented variables in the forest plot 
+ids_1_DF$Feature <- factor(ids_1_DF$Feature, 
+                         levels = c("Total Sleep Time (M)", 
+                                    "Total Sleep Time (SD)", 
+                                    "Sleep Efficiency (M)",
+                                    "Sleep Efficiency (SD)"
+                                    ))
+ids_2_DF$Feature <- factor(ids_2_DF$Feature, 
+                         levels = c("Total Sleep Time (M)", 
+                                    "Total Sleep Time (SD)", 
+                                    "Sleep Efficiency (M)",
+                                    "Sleep Efficiency (SD)"
+                                    ))
+ids_3_DF$Feature <- factor(ids_3_DF$Feature, 
+                         levels = c("Total Sleep Time (M)", 
+                                    "Total Sleep Time (SD)", 
+                                    "Sleep Efficiency (M)",
+                                    "Sleep Efficiency (SD)"
+                                    ))
+
+ids_4_DF$Feature <- factor(ids_4_DF$Feature, 
+                         levels = c("Total Sleep Time (M)", 
+                                    "Total Sleep Time (SD)", 
+                                    "Sleep Efficiency (M)",
+                                    "Sleep Efficiency (SD)"
+                                    ))
+
+ids_5_DF$Feature <- factor(ids_5_DF$Feature, 
+                         levels = c("Total Sleep Time (M)", 
+                                    "Total Sleep Time (SD)", 
+                                    "Sleep Efficiency (M)", 
+                                    "Sleep Efficiency (SD)",
+                                    "Sedentary Time (M)",
+                                    "Sedentary Time (SD)",
+                                    "Vigorous Activity (M)",
+                                    "Vigorous Activity (SD)"
+                                    ))
+
+ids_15_DF$Feature <- factor(ids_15_DF$Feature, 
+                         levels = c("Total Sleep Time (M)", 
+                                    "Total Sleep Time (SD)", 
+                                    "Sleep Efficiency (M)", 
+                                    "Sleep Efficiency (SD)",
+                                    "Sedentary Time (M)",
+                                    "Sedentary Time (SD)",
+                                    "Vigorous Activity (M)",
+                                    "Vigorous Activity (SD)"
+                                    ))
+
+ids_16_DF$Feature <- factor(ids_16_DF$Feature, 
+                         levels = c("Total Sleep Time (M)", 
+                                    "Total Sleep Time (SD)", 
+                                    "Sleep Efficiency (M)", 
+                                    "Sleep Efficiency (SD)",
+                                    "Sedentary Time (M)",
+                                    "Sedentary Time (SD)",
+                                    "Vigorous Activity (M)",
+                                    "Vigorous Activity (SD)"
+                                    ))
+
+ids_18_DF$Feature <- factor(ids_18_DF$Feature, 
+                         levels = c("Total Sleep Time (M)", 
+                                    "Total Sleep Time (SD)", 
+                                    "Sleep Efficiency (M)", 
+                                    "Sleep Efficiency (SD)",
+                                    "Sedentary Time (M)",
+                                    "Sedentary Time (SD)",
+                                    "Vigorous Activity (M)",
+                                    "Vigorous Activity (SD)"
+                                    ))
+
+ids_19_DF$Feature <- factor(ids_19_DF$Feature, 
+                         levels = c("Total Sleep Time (M)", 
+                                    "Total Sleep Time (SD)", 
+                                    "Sleep Efficiency (M)", 
+                                    "Sleep Efficiency (SD)",
+                                    "Sedentary Time (M)",
+                                    "Sedentary Time (SD)",
+                                    "Vigorous Activity (M)",
+                                    "Vigorous Activity (SD)"
+                                    ))
+
+ids_20_DF$Feature <- factor(ids_20_DF$Feature, 
+                         levels = c("Total Sleep Time (M)", 
+                                    "Total Sleep Time (SD)", 
+                                    "Sleep Efficiency (M)", 
+                                    "Sleep Efficiency (SD)",
+                                    "Sedentary Time (M)",
+                                    "Sedentary Time (SD)",
+                                    "Vigorous Activity (M)",
+                                    "Vigorous Activity (SD)"
+                                    ))
+
+ids_23_DF$Feature <- factor(ids_23_DF$Feature, 
+                         levels = c("Sedentary Time (M)",
+                                    "Sedentary Time (SD)",
+                                    "Vigorous Activity (M)",
+                                    "Vigorous Activity (SD)",
+                                    "(S) Speaking rate (M)", 
+                                    "(S) Intensity (M)"
+                                    ))   
+
+ids_24_DF$Feature <- factor(ids_24_DF$Feature, 
+                         levels = c("Sedentary Time (M)",
+                                    "Sedentary Time (SD)",
+                                    "Vigorous Activity (M)",
+                                    "Vigorous Activity (SD)",
+                                    "(S) Speaking rate (M)", 
+                                    "(S) Intensity (M)"
+                                    ))          
+# Define the function
+add_nudge <- function(data) {
+  data <- data |>
+    mutate(nudge = case_when(
+      Model_type == "Total_Effect" ~ 0,
+      Model_type == "PM_Effect" ~ 0.2,
+      Model_type == "PCM_Effect" ~ -0.2
+    ))
+  return(data)
+}
+
+# Calling the function 
+ids_1_DF <- add_nudge(ids_1_DF)
+ids_2_DF<- add_nudge(ids_2_DF)
+ids_3_DF <- add_nudge(ids_3_DF)
+ids_4_DF <- add_nudge(ids_4_DF)
+ids_5_DF <- add_nudge(ids_5_DF)
+ids_15_DF <- add_nudge(ids_15_DF)
+ids_16_DF <- add_nudge(ids_16_DF)
+ids_18_DF <- add_nudge(ids_18_DF)
+ids_19_DF <- add_nudge(ids_19_DF)
+ids_20_DF <- add_nudge(ids_20_DF)
+ids_23_DF <- add_nudge(ids_23_DF)
+ids_24_DF <- add_nudge(ids_24_DF)
+
+#define colours for dots and bars
+dotCols = c("#6FC3DC","#C8DDA5", "#FFB084")
+barCols = c("#00708C","#7F9C22", "#FF8939")
+
+# Create Forest Plot 
+create_forest_plot <- function(data, xseq, xscale, title_suffix) {
+  ggplot(data) +
+  aes(x = OR_Est, 
+      y = Feature, 
+      xmin = OR_LO, 
+      xmax = OR_HI, 
+      color = Model_type, 
+      fill = Model_type) +
+  geom_errorbarh(height = 0,
+                 size = 3,
+                 position = position_nudge(y = data$nudge)) +
+  
+  geom_point(size = 3, shape =21, colour="white", stroke = 0.5, position =
+               position_nudge(y = data$nudge)) +
+  scale_color_manual(values = dotCols, 
+                     labels = c("PCM_Effect" = "Within-Participant Effect", 
+                                "PM_Effect" = "Between-Participant Effect" 
+                                ,"Total_Effect" = "Total Effect"
+                                )) +
+    
+  geom_vline(xintercept = 1, color = "black", linetype = "dashed", size = 0.5) +  
+  labs(x = " ", 
+       y = NULL, 
+       title = paste(title_suffix, ""), 
+       color = "Model Type") +
+    
+  theme(
+    strip.text.y.left = element_text(face = "bold", family = font,
+                              size = 12,
+                              hjust = 0.5,
+                              angle = 0, vjust = 0.5, 
+                    color= "black"),
+    plot.title = element_text(size = 15, hjust=0.5, face = "bold", family = font),
+    axis.ticks.y=element_blank(),
+    axis.text.x = element_text(family = font, size = 10),  
+    axis.text.y = element_blank(), 
+    axis.title=element_text(size=15,face="bold", family = font), 
+    plot.margin = margin(t = 0.3, r = 0, b = 0, l = 0.2, unit = "cm"), 
+    panel.grid.minor = element_blank(),  
+    legend.position = "none"
+
+    ) +
+  guides(fill = FALSE) +
+  scale_x_log10(breaks = xseq) +
+  coord_cartesian(xlim = xscale) +
+    
+  scale_fill_manual(values = barCols)+
+  facet_grid(rows = vars(Feature),
+             scales = "free",
+             switch = "y"  ) 
+  }
+
+p3 <- create_forest_plot(ids_1_DF,seq(0.5, 4, 0.5), c(0.4, 4), "Sleep Onset Insomnia")
+p3a <- create_forest_plot(ids_2_DF,seq(0.5, 4, 0.5), c(0.4, 4), "Middle Insomnia")
+p3b <- create_forest_plot(ids_3_DF,seq(0.5, 4, 0.5), c(0.4, 4), "Early Morning insomnia")
+p3c <- create_forest_plot(ids_4_DF,seq(0.5, 4, 0.5), c(0.4, 4), "Hypersomnia ")
+
+p2b <- create_forest_plot(ids_5_DF,seq(0.2, 3, 0.4), c(0.3, 3), "Low Mood")
+p2a <- create_forest_plot(ids_15_DF,seq(0.2, 3, 0.4), c(0.3, 3), "Lack of Concentration")
+p2 <- create_forest_plot(ids_16_DF, seq(0.2, 3, 0.4), c(0.3, 3),"Guilt")
+
+p2c<- create_forest_plot(ids_18_DF,seq(0.2, 3, 0.4), c(0.3, 3), "Suicidal Thoughts")
+p2d <- create_forest_plot(ids_19_DF,seq(0.2, 3, 0.4), c(0.3, 3), "Anhedonia")
+
+p1a <- create_forest_plot(ids_20_DF, seq(0.2, 2.5, 0.4), c(0.17, 2.5),"Fatigue")
+p1b <- create_forest_plot(ids_23_DF, seq(0.2, 2.5, 0.4), c(0.17, 2.5),"Psychomotor Retardation")
+p1c <- create_forest_plot(ids_24_DF, seq(0.2, 2.5, 0.4), c(0.17, 2.5),"Psychomotor Agitation")
+
+#
+plot_list <- list(p1a, p1b , p1c)
+combined_plot <- plot_grid(plotlist = plot_list, nrow = 1)
+print(combined_plot)
+
+#plot_list <- list(p1a, p1b , p1c)
+combined_plot <- plot_grid(
+  p1a,                              
+  plot_grid(p1b, p1c, ncol = 1, rel_heights = c(1, 1)),  
+  ncol = 2,                                     
+  rel_widths = c(1, 1)                          
+)
+print(combined_plot)
+
+plot_list <- list(p2, p2a, p2b,p2c, p2d)
+combined_plot <- plot_grid(plotlist = plot_list, nrow = 2)
+print(combined_plot)
+
+plot_list <- list(p3, p3a, p3b, p3c)
+combined_plot <- plot_grid(plotlist = plot_list, nrow = 2)
+print(combined_plot)
+
+```
+
+# Frequencies
+
+```{r}
+print(total_unique_ids(ssp2))
+print(total_unique_ids(ssp_data))
+print(nrows(ssp_data))
+print(nrows(ssp2))
+
+
+print(total_unique_ids(act2))
+print(total_unique_ids(act_data))
+print(nrows(act2))
+print(nrows(act_data))
+
+print(total_unique_ids(sleep2))
+print(total_unique_ids(sleep_data))
+print(nrows(sleep2))
+print(nrows(sleep_data))
+```
